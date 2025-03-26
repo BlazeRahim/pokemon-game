@@ -1,0 +1,250 @@
+import random
+import pickle
+import numpy as np
+
+# Import your existing modules
+from pokemon import Pokemon
+from trainer import Trainer
+from battle_logic import calculate_damage, perform_move
+import battle_ai  # Baseline AI from your battle_ai.py
+import typeRelation
+from battle_test import moves  # Global moves dictionary containing all moves
+
+# -------------------- Q-LEARNING HYPERPARAMETERS -------------------- #
+ALPHA = 0.1      # Learning rate
+GAMMA = 0.9      # Discount factor
+EPSILON = 0.1    # Exploration rate
+
+# Global Q-table: key = (state, action), value = Q-value
+Q_table = {}
+
+# -------------------- UTILITY FUNCTIONS -------------------- #
+def get_Q(state, action):
+    """Retrieve Q-value for a given state-action pair (defaulting to 0)."""
+    return Q_table.get((state, action), 0)
+
+def update_Q(state, action, reward, next_state, moves_list):
+    """Update Q-value for the state-action pair using the Q-learning formula."""
+    max_future_q = max([get_Q(next_state, m) for m in moves_list], default=0)
+    current_q = get_Q(state, action)
+    Q_table[(state, action)] = current_q + ALPHA * (reward + GAMMA * max_future_q - current_q)
+
+def save_Q_table(filename="q_table.pkl"):
+    """Persist the Q-table to disk."""
+    with open(filename, "wb") as f:
+        pickle.dump(Q_table, f)
+
+def load_Q_table(filename="q_table.pkl"):
+    """Load the Q-table from disk."""
+    global Q_table
+    try:
+        with open(filename, "rb") as f:
+            Q_table = pickle.load(f)
+    except FileNotFoundError:
+        print("No Q-table found, starting fresh.")
+
+def encode_state(attacker, defender):
+    """
+    Encode the battle state as a tuple.
+    State includes: normalized HP of attacker and defender, their types, and their statuses.
+    """
+    return (
+        round(attacker.hp / attacker.max_hp, 2),
+        round(defender.hp / defender.max_hp, 2),
+        tuple(attacker.typing),
+        tuple(defender.typing),
+        attacker.status,
+        defender.status
+    )
+
+def choose_move_RL(state, moves_available):
+    """
+    Choose a move from the global moves using an ε-greedy policy:
+      - With probability EPSILON, select a random move.
+      - Otherwise, select the move with the highest Q-value.
+    """
+    available = list(moves_available.keys())
+    if random.uniform(0, 1) < EPSILON:
+        chosen = random.choice(available)
+        print(f"[RL] Exploration: Randomly selected move '{chosen}'")
+    else:
+        chosen = max(available, key=lambda m: get_Q(state, m))
+        print(f"[RL] Exploitation: Selected best move '{chosen}' with Q-value {get_Q(state, chosen):.2f}")
+    return chosen
+
+def calculate_reward(attacker, defender, move, estimated_damage):
+    """
+    Calculate a reward based on the move's effectiveness.
+    Rewards:
+      - KO bonus: +50 if move can KO the defender.
+      - STAB bonus: +10 if move's type is in attacker's types.
+      - Type effectiveness: +30 per super-effective factor; -20 per resisted factor; -50 if no effect.
+      - Bonus for status moves and healing moves.
+    """
+    reward = 0
+    if estimated_damage >= defender.hp:
+        reward += 50
+    if move["type"] in attacker.typing:
+        reward += 10
+    for d_type in defender.typing:
+        effectiveness = typeRelation.type_relation[move["type"]].get(d_type, 1)
+        if effectiveness > 1:
+            reward += 30
+        elif effectiveness < 1:
+            reward -= 20
+        elif effectiveness == 0:
+            reward -= 50
+    if move["statusChange"][0] and defender.status is None:
+        status_effect = move["statusChange"][1]
+        reward += 20 if status_effect in ["burn", "paralyze", "toxic"] else 10
+    if move["heals"][0] and attacker.hp <= attacker.max_hp * 0.5:
+        reward += 40
+    print(f"[Reward] Move '{move['name']}' generated reward: {reward}")
+    return reward
+
+def battleAI_RL(attacker, defender):
+    """
+    RL-based move selection using all moves.
+    1. Encode current state.
+    2. Choose a move from the global moves using an ε-greedy policy.
+    3. Estimate damage, execute the move, and calculate reward.
+    4. Update Q-table and return the chosen move.
+    """
+    state = encode_state(attacker, defender)
+    move_name = choose_move_RL(state, moves)
+    move = moves[move_name]
+
+    estimated_damage = calculate_damage(attacker, defender, move)
+    print(f"[RL] Estimated damage by '{move['name']}': {estimated_damage}")
+
+    perform_move(attacker, defender, move)
+
+    reward = calculate_reward(attacker, defender, move, estimated_damage)
+    next_state = encode_state(attacker, defender)
+    update_Q(state, move_name, reward, next_state, list(moves.keys()))
+    print(f"[RL] Updated Q-value for state {state} and action '{move_name}': {get_Q(state, move_name):.2f}")
+    return move_name
+
+# -------------------- GENERIC POKÉMON CLASS -------------------- #
+class GenericPokemon:
+    """
+    A generic Pokémon for RL training that uses the entire global moves dictionary.
+    """
+    def __init__(self):
+        self.name = "GenericPokemon"  # Added name attribute
+        self.hp = 100
+        self.max_hp = 100
+        self.typing = ["normal"]
+        self.status = None
+        self.level = 50
+        self.critical_hit = 1
+        self.critical_multiplier = 1.5
+        self.stab_multiplier = 1.5
+        self.accuracy = 1.0
+        self.evasion = 1.0
+        self.ability = "none"  # Default ability
+        self.base_stats = {
+            "attack": 50,
+            "sp_attack": 50,
+            "defense": 50,
+            "sp_defense": 50,
+            "speed": 50
+        }
+        self.current_stats = self.base_stats.copy()
+        # Use global moves for all available moves.
+        self.moves = moves
+
+    def take_damage(self, damage):
+        self.hp = max(0, self.hp - damage)
+
+    def is_fainted(self):
+        return self.hp <= 0
+
+# -------------------- SIMULATION LOOP -------------------- #
+def simulate_battle_RL(rl_trainer, opp_trainer):
+    """
+    Simulate a battle between two trainers with alternating turn order.
+    Both Pokémon use the global moves set.
+    """
+    print("\n" + "="*40)
+    print("Starting new battle simulation")
+    print("="*40)
+
+    agent = rl_trainer.get_active_pokemon()
+    opp = opp_trainer.get_active_pokemon()
+    agent.hp = agent.max_hp
+    opp.hp = opp.max_hp
+
+    turn = 1
+    while not agent.is_fainted() and not opp.is_fainted():
+        print(f"\n--- Turn {turn} ---")
+        print(f"{agent.name} HP: {agent.hp}/{agent.max_hp}")
+        print(f"{opp.name} HP: {opp.hp}/{opp.max_hp}")
+        if turn % 2 == 1:
+            print(f"[Turn Order] {agent.name} (RL Agent) attacks first.")
+            move_rl = battleAI_RL(agent, opp)
+            print(f"{agent.name} (RL Agent) used '{move_rl}'.")
+            print(f"After move, {opp.name} HP: {opp.hp}/{opp.max_hp}")
+            if opp.is_fainted():
+                print(f"{opp.name} fainted!")
+                break
+            move_opp = battle_ai.battleAI(opp, agent)
+            perform_move(opp, agent, opp.moves[move_opp])
+            print(f"{opp.name} (Opponent) used '{move_opp}'.")
+            print(f"After move, {agent.name} HP: {agent.hp}/{agent.max_hp}")
+            if agent.is_fainted():
+                print(f"{agent.name} fainted!")
+                break
+        else:
+            print(f"[Turn Order] {opp.name} (Opponent) attacks first.")
+            move_opp = battle_ai.battleAI(opp, agent)
+            perform_move(opp, agent, opp.moves[move_opp])
+            print(f"{opp.name} (Opponent) used '{move_opp}'.")
+            print(f"After move, {agent.name} HP: {agent.hp}/{agent.max_hp}")
+            if agent.is_fainted():
+                print(f"{agent.name} fainted!")
+                break
+            move_rl = battleAI_RL(agent, opp)
+            print(f"{agent.name} (RL Agent) used '{move_rl}'.")
+            print(f"After move, {opp.name} HP: {opp.hp}/{opp.max_hp}")
+            if opp.is_fainted():
+                print(f"{opp.name} fainted!")
+                break
+        turn += 1
+
+    if opp.is_fainted():
+        final_reward = 100
+        print(f"\nBattle result: {agent.name} wins!")
+    else:
+        final_reward = -100
+        print(f"\nBattle result: {opp.name} wins!")
+    
+    final_state = encode_state(agent, opp)
+    update_Q(final_state, move_rl, final_reward, final_state, list(agent.moves.keys()))
+    print(f"[Final Update] Terminal reward applied. Final Q-value for move '{move_rl}': {get_Q(final_state, move_rl):.2f}")
+    print("="*40 + "\n")
+    return not agent.is_fainted()
+
+# -------------------- TRAINING LOOP -------------------- #
+def train_RL_agent(episodes=1000):
+    """
+    Train the RL agent by simulating multiple battles.
+    Each trainer uses a GenericPokemon that has access to all moves.
+    """
+    load_Q_table()
+    wins = 0
+    for episode in range(episodes):
+        rl_trainer = Trainer("RL_Agent", [GenericPokemon()])
+        opp_trainer = Trainer("Baseline", [GenericPokemon()])
+        
+        print(f"=== Episode {episode+1} ===")
+        result = simulate_battle_RL(rl_trainer, opp_trainer)
+        if result:
+            wins += 1
+        print(f"Episode {episode+1} complete. Cumulative win rate: {wins / (episode+1):.2f}\n")
+    save_Q_table()
+    print("Training complete. Q-table saved.")
+
+# -------------------- MAIN ENTRY POINT -------------------- #
+if __name__ == "__main__":
+    train_RL_agent(episodes=10000)
